@@ -42,17 +42,27 @@ class RelayHandler implements Runnable {
                 String request = inFromRelay.readLine();
                 if (request == null) break;
 
-                int packetIndex = Integer.parseInt(request);
-                if (packetIndex >= 0 && packetIndex < videoPackets.length) {
-                    System.out.println("Server: Sending Packet " + packetIndex);
-                    outToRelay.writeUTF(videoPackets[packetIndex]);
-                } else {
-                    outToRelay.writeUTF("NACK");
+                if (request.startsWith("NACK")) {
+                    int packetIndex = Integer.parseInt(request.split(" ")[1]);
+                    sendPacket(packetIndex);
+                    continue;
                 }
-                outToRelay.flush();
+
+                int packetIndex = Integer.parseInt(request);
+                sendPacket(packetIndex);
             }
         } catch (IOException e) {
             System.out.println("Server: Relay connection closed.");
         }
+    }
+
+    private void sendPacket(int packetIndex) throws IOException {
+        if (packetIndex >= 0 && packetIndex < videoPackets.length) {
+            System.out.println("Server: Sending Packet " + packetIndex);
+            outToRelay.writeUTF(videoPackets[packetIndex]);
+        } else {
+            outToRelay.writeUTF("NACK");
+        }
+        outToRelay.flush();
     }
 }

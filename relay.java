@@ -4,8 +4,9 @@ import java.util.*;
 
 class VideoRelay {
     private static final int SERVER_PORT = 5000;
-    private static final int TIMEOUT = 300000; // 5 minutes
     private static final int BUFFER_SIZE = 100;
+    private static final int TIMEOUT = 10000; // 10 seconds timeout
+
     public static final Map<Integer, LinkedHashMap<Integer, String>> relayBuffer = new HashMap<>();
 
     public static void main(String[] args) throws IOException {
@@ -16,7 +17,7 @@ class VideoRelay {
         int relayPort = relayServerSocket.getLocalPort();
         System.out.println("Relay listening on port: " + relayPort);
 
-        relayBuffer.put(relayPort, new LinkedHashMap<>(BUFFER_SIZE, 0.75f, true) {
+        relayBuffer.put(relayPort, new LinkedHashMap<Integer, String>(BUFFER_SIZE, 0.75f, true) {
             @Override
             protected boolean removeEldestEntry(Map.Entry<Integer, String> eldest) {
                 return size() > BUFFER_SIZE;
@@ -64,6 +65,16 @@ class ClientHandler implements Runnable {
                     continue;
                 }
 
+                if (request.startsWith("NACK")) {
+                    int packetIndex = Integer.parseInt(request.split(" ")[1]);
+                    outToServer.println("NACK " + packetIndex);
+                    String packet = inFromServer.readUTF();
+                    buffer.put(packetIndex, packet);
+                    outToClient.writeUTF(packet);
+                    outToClient.flush();
+                    continue;
+                }
+
                 int packetIndex = Integer.parseInt(request);
                 String packet;
 
@@ -73,21 +84,17 @@ class ClientHandler implements Runnable {
                 } else {
                     outToServer.println(packetIndex);
                     packet = inFromServer.readUTF();
-
-                    if (packet.equals("NACK")) {
-                        outToClient.writeUTF("NACK");
-                        outToClient.flush();
-                        continue;
+                    if (!packet.equals("NACK")) {
+                        buffer.put(packetIndex, packet);
                     }
-
-                    buffer.put(packetIndex, packet);
-                    System.out.println("Relay: Fetched from server " + packet);
+                    System.out.println("Relay: Fetching from server " + packet);
                 }
 
                 outToClient.writeUTF(packet);
                 outToClient.flush();
             }
 
+            System.out.println("Relay: Transmission complete.");
             clientSocket.close();
         } catch (SocketTimeoutException e) {
             System.out.println("Client timed out. Closing connection.");

@@ -7,10 +7,30 @@ class VideoServer {
     public static final String VIDEO_DIR = "Videos/";         
     public static final String FRAME_DIR = "Video Frames/";//path to store frame//
     public static final Map<String, File[]> videoFrames = new HashMap<>();
-
+    private static String getWifiIPAddress() {
+        try {
+            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+            while (interfaces.hasMoreElements()) {
+                NetworkInterface net = interfaces.nextElement();
+                if (net.isUp() && !net.isLoopback() && !net.getDisplayName().toLowerCase().contains("virtual")) {
+                    Enumeration<InetAddress> addresses = net.getInetAddresses();
+                    while (addresses.hasMoreElements()) {
+                        InetAddress addr = addresses.nextElement();
+                        if (addr instanceof Inet4Address && addr.getHostAddress().startsWith("192.168")) {
+                            return addr.getHostAddress();
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        return "localhost";
+    }
     public static void main(String[] args) throws IOException, InterruptedException {
         processVideos();
-
+        
+        System.out.println("Server is running in IP: "+getWifiIPAddress()+"at port no"+SERVER_PORT);
         ServerSocket serverSocket = new ServerSocket(SERVER_PORT);
         System.out.println("DEBUG (Server): Waiting for relay connections...");
 

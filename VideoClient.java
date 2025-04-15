@@ -24,17 +24,42 @@ public class VideoClient {
     private static int cwnd = 1;
     private static int ssthresh = 10;
     private static final int maxCwnd = 50;
-
+    
+    private static String getWifiIPAddress() {
+        try {
+            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+            while (interfaces.hasMoreElements()) {
+                NetworkInterface net = interfaces.nextElement();
+                if (net.isUp() && !net.isLoopback() && !net.getDisplayName().toLowerCase().contains("virtual")) {
+                    Enumeration<InetAddress> addresses = net.getInetAddresses();
+                    while (addresses.hasMoreElements()) {
+                        InetAddress addr = addresses.nextElement();
+                        if (addr instanceof Inet4Address && addr.getHostAddress().startsWith("192.168")) {
+                            return addr.getHostAddress();
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        return "localhost";
+    }
+    
     public static void main(String[] args) throws IOException {
         Scanner scanner = new Scanner(System.in);
-
+        System.out.print("Enter relay IP Address: ");
+        String relayIP = scanner.nextLine();
         System.out.print("Enter relay port: ");
         int relayPort = scanner.nextInt();
         scanner.nextLine();
-
-        Socket relaySocket = new Socket("localhost", relayPort);
+        System.out.println("The device is running in IP Address: " + getWifiIPAddress());
+        
+        // Maintain a single connection to the relay throughout
+        Socket relaySocket = new Socket(relayIP, relayPort);
         System.out.println("Client connected to relay on port " + relayPort);
-
+        String IP = InetAddress.getLocalHost().getHostAddress();
+        System.out.println("Client is running in IP: "+IP);
         DataInputStream in = new DataInputStream(relaySocket.getInputStream());
         PrintWriter out = new PrintWriter(relaySocket.getOutputStream(), true);
 
@@ -127,6 +152,7 @@ public class VideoClient {
 
         darkModeButton.addActionListener(e -> toggleDarkMode());
 
+        // Main loop for video requests
         while (isRunning) {
             System.out.print("Enter video name and number of frames (e.g., marc 300) or 0 to exit: ");
             String videoInput = scanner.nextLine();
@@ -138,7 +164,6 @@ public class VideoClient {
                 break;
             }
 
-            out.println(videoInput);
             String[] inputParts = videoInput.split(" ");
             if (inputParts.length != 2) {
                 System.out.println("Invalid input format! Use: <VideoName> <NumberOfFrames>");
@@ -151,76 +176,102 @@ public class VideoClient {
             progressBar.setMaximum(numFrames);
             progressBar.setValue(0);
             timelineSlider.setMaximum(numFrames);
+            timelineSlider.setValue(0);
             timelineSlider.setEnabled(true);
 
-            for (int i = 0; i < numFrames; i += cwnd) {
-                for (int j = i; j < Math.min(i + cwnd, numFrames); j++) {
-                    while (isPaused) {
-                        try {
-                            Thread.sleep(100);
-                        } catch (InterruptedException ex) {}
-                    }
-
-                    System.out.println("Client: Requesting frame " + j);
-                    out.println(videoName + " " + j);
-
-                    int frameSize = in.readInt();
-                    byte[] frameData = new byte[frameSize];
-                    in.readFully(frameData);
-                    int receivedChecksum = in.readInt();
-
-                    if (receivedChecksum != calculateChecksum(frameData)) {
-                        logLabel.setText("Logs: Checksum failed for frame " + j + ". Requesting retransmission.");
-                        out.println("NACK " + j);
-                        ssthresh = Math.max(cwnd / 2, 1);
-                        cwnd = 1;
-                    } else {
-                        if (cwnd < ssthresh) {
-                            cwnd *= 2;
-                        } else {
-                            cwnd++;
-                        }
-                        cwnd = Math.min(cwnd, maxCwnd);
-                    }
-
-                    ByteArrayInputStream bis = new ByteArrayInputStream(frameData);
-                    BufferedImage image = null;
+            // Request each frame individually
+            for (int frameIndex = 0; frameIndex < numFrames; frameIndex++) {
+                while (isPaused) {
                     try {
-                        image = ImageIO.read(bis);
-                    } catch (Exception e) {
-                        System.out.println("Error decoding frame " + j + ": " + e.getMessage());
-                    }
+                        Thread.sleep(100);
+                    } catch (InterruptedException ex) {}
+                }
 
-                    if (image != null) {
-                        videoLabel.setIcon(new ImageIcon(image));
+                System.out.println("Client: Requesting frame " + frameIndex);
+                // Send individual frame request
+                out.println(videoName + " " + frameIndex);
+
+                // Receive frame data
+                int frameSize = in.readInt();
+                byte[] frameData = new byte[frameSize];
+                in.readFully(frameData);
+                int receivedChecksum = in.readInt();
+                
+                // Receive cache status (new field added)
+                boolean fromCache = in.readBoolean();
+                String cacheStatus = fromCache ? "from CACHE" : "from SERVER";
+                System.out.println("Client: Received frame " + frameIndex + " " + cacheStatus);
+
+                // Verify checksum
+                if (receivedChecksum != calculateChecksum(frameData)) {
+                    logLabel.setText("Logs: Checksum failed for frame " + frameIndex + ". Requesting retransmission.");
+                    out.println("NACK " + frameIndex);
+                    ssthresh = Math.max(cwnd / 2, 1);
+                    cwnd = 1;
+                    frameIndex--; // Retry the same frame
+                    continue;
+                } else {
+                    // AIMD congestion control
+                    if (cwnd < ssthresh) {
+                        cwnd *= 2; // Exponential increase
+                    } else {
+                        cwnd++; // Additive increase
+                    }
+                    cwnd = Math.min(cwnd, maxCwnd);
+                }
+
+                // Process the received frame
+                ByteArrayInputStream bis = new ByteArrayInputStream(frameData);
+                BufferedImage image = null;
+                try {
+                    image = ImageIO.read(bis);
+                } catch (Exception e) {
+                    System.out.println("Error decoding frame " + frameIndex + ": " + e.getMessage());
+                    frameIndex--; // Retry the same frame
+                    continue;
+                }
+
+                // Display the frame
+                if (image != null) {
+                    final BufferedImage displayImage = image;
+                    final int currentFrame = frameIndex;
+                    final String logMessage = "Logs: Displaying frame " + currentFrame + " " + cacheStatus;
+                    
+                    SwingUtilities.invokeLater(() -> {
+                        videoLabel.setIcon(new ImageIcon(displayImage));
                         frame.repaint();
-                        logLabel.setText("Logs: Displaying frame " + j);
-                        progressBar.setValue(j + 1);
-                        timelineSlider.setValue(j);
+                        logLabel.setText(logMessage);
+                        progressBar.setValue(currentFrame + 1);
+                        timelineSlider.setValue(currentFrame);
+                    });
 
-                        // ✅ Free old cached frames
-                        if (frameCache.size() > 100) {
-                            int firstKey = frameCache.keySet().iterator().next();
+                    // Cache management
+                    if (frameCache.size() > 100) {
+                        int firstKey = frameCache.keySet().iterator().next();
+                        if (frameCache.get(firstKey) != null) {
                             frameCache.get(firstKey).flush();
-                            frameCache.remove(firstKey);
                         }
-
-                        frameCache.put(j, image);
-
-                        long currentTime = System.currentTimeMillis();
-                        double fps = 1000.0 / (currentTime - lastFrameTime);
-                        lastFrameTime = currentTime;
-                        fpsLabel.setText("FPS: " + String.format("%.2f", fps));
-
-                        image.flush();
-                        image = null;
+                        frameCache.remove(firstKey);
                     }
+                    frameCache.put(frameIndex, image);
+
+                    // FPS calculation
+                    long currentTime = System.currentTimeMillis();
+                    double fps = 1000.0 / (currentTime - lastFrameTime);
+                    lastFrameTime = currentTime;
+                    final String fpsText = "FPS: " + String.format("%.2f", fps);
+                    
+                    SwingUtilities.invokeLater(() -> {
+                        fpsLabel.setText(fpsText);
+                    });
                 }
-                // ✅ Force garbage collection every 50 frames
-                if (i % 50 == 0) {
+
+                // Memory management
+                if (frameIndex % 50 == 0) {
                     System.gc();
-                    System.out.println("DEBUG: Memory cleaned at frame " + i);
+                    System.out.println("DEBUG: Memory cleaned at frame " + frameIndex);
                 }
+                
                 System.out.println("Client: cwnd = " + cwnd + ", ssthresh = " + ssthresh);
             }
         }
@@ -235,6 +286,18 @@ public class VideoClient {
 
     private static void toggleDarkMode() {
         darkMode = !darkMode;
+        if (darkMode) {
+            frame.getContentPane().setBackground(new Color(40, 40, 40));
+            controlPanel.setBackground(new Color(60, 60, 60));
+            videoLabel.setBorder(BorderFactory.createLineBorder(Color.WHITE, 2));
+            logLabel.setForeground(Color.LIGHT_GRAY);
+        } else {
+            frame.getContentPane().setBackground(UIManager.getColor("Panel.background"));
+            controlPanel.setBackground(new Color(230, 230, 230));
+            videoLabel.setBorder(BorderFactory.createLineBorder(Color.BLACK, 2));
+            logLabel.setForeground(Color.DARK_GRAY);
+        }
+        frame.repaint();
     }
 
     private static int calculateChecksum(byte[] data) {

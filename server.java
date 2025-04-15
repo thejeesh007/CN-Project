@@ -5,7 +5,7 @@ import java.util.*;
 class VideoServer {
     private static final int SERVER_PORT = 5000;
     public static final String VIDEO_DIR = "Videos\\";         
-    public static final String FRAME_DIR = "Video Frames\\";       
+    public static final String FRAME_DIR = "Video Frames\\";//path to store frame//
     public static final Map<String, File[]> videoFrames = new HashMap<>();
 
     public static void main(String[] args) throws IOException, InterruptedException {

@@ -1,12 +1,10 @@
 import java.io.*;
 import java.net.*;
 import java.util.*;
-import java.util.HashSet;
-import java.util.Set;
 
 class VideoRelay {
     private static final int SERVER_PORT = 5000;
-    private static final int BUFFER_SIZE = 100;
+    private static final int BUFFER_SIZE = 500; // Increased from 100 to 500
     private static final int TIMEOUT = 10000;
 
     private static final double ADDITIVE_INCREASE = 1.0;
@@ -22,12 +20,37 @@ class VideoRelay {
 
     // LRU Cache for video frames (each video is cached by a LinkedHashMap mapping frame index → byte[]).
     // The key of the outer map is the video name.
-    public static final Map<String, LinkedHashMap<Integer, byte[]>> relayCache = new HashMap<>();
-
+    // Making the cache size much larger to preserve more frames across requests
+    public static final Map<String, Map<Integer, byte[]>> relayCache = new HashMap<>();
+    
+    private static String getWifiIPAddress() {
+        try {
+            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+            while (interfaces.hasMoreElements()) {
+                NetworkInterface net = interfaces.nextElement();
+                if (net.isUp() && !net.isLoopback() && !net.getDisplayName().toLowerCase().contains("virtual")) {
+                    Enumeration<InetAddress> addresses = net.getInetAddresses();
+                    while (addresses.hasMoreElements()) {
+                        InetAddress addr = addresses.nextElement();
+                        if (addr instanceof Inet4Address && addr.getHostAddress().startsWith("192.168")) {
+                            return addr.getHostAddress();
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        return "localhost";
+    }
+    
     public static void main(String[] args) throws IOException {
-        Socket serverSocket = new Socket("127.0.0.1", SERVER_PORT); // Linux-compatible IP
+        Scanner sc = new Scanner(System.in);
+        System.out.println("Enter Server IP Address");
+        String serverIP = sc.nextLine();
+        Socket serverSocket = new Socket(serverIP, SERVER_PORT); // Linux-compatible IP
         System.out.println("DEBUG (Relay): Connected to server at port " + SERVER_PORT);
-
+        System.out.println("Relay is running in IP: "+ getWifiIPAddress());
         ServerSocket relayServerSocket = new ServerSocket(0);
         int relayPort = relayServerSocket.getLocalPort();
         System.out.println("DEBUG (Relay): Listening on port: " + relayPort);
@@ -63,14 +86,12 @@ class VideoRelay {
         private DataInputStream inFromServer;
         private DataOutputStream outToClient;
         private PrintWriter outToServer;
-        private String currentVideo = null;
-        private int lastDelivered = 0;
-
-        // ⬇️ Added: Set to track which cached frames have been logged
-        private final Set<String> cacheHitLogged = new HashSet<>();
-
-        // ⬇️ Added: Set to track what frames have already been sent
-        private final Set<Integer> deliveredFrames = new HashSet<>();
+        
+        // Stats tracking
+        private int cacheHits = 0;
+        private int cacheMisses = 0;
+        private Map<String, Integer> videoHitStats = new HashMap<>();
+        private Map<String, Integer> videoMissStats = new HashMap<>();
 
         public ClientHandler(Socket client, Socket server) {
             this.clientSocket = client;
@@ -101,14 +122,56 @@ class VideoRelay {
                         break;
                     }
 
-                    handleFrameRequest(request);
+                    // Handle individual frame request (from client incremental fetch)
+                    if (request.startsWith("NACK")) {
+                        String[] nackParts = request.split(" ");
+                        if (nackParts.length == 2) {
+                            int frameIndex = Integer.parseInt(nackParts[1]);
+                            // This would need additional handling for NACK
+                            continue;
+                        }
+                    }
+
+                    // Handle normal video request which comes directly from client
+                    handleVideoRequest(request);
+                    
+                    // Print cache stats periodically
+                    if ((cacheHits + cacheMisses) % 50 == 0) {
+                        printCacheStats();
+                    }
                 }
             } catch (IOException e) {
                 System.out.println("DEBUG (Relay): Connection lost.");
+                e.printStackTrace();
             }
         }
 
-        private void handleFrameRequest(String request) throws IOException {
+        private void printCacheStats() {
+            System.out.println("========= CACHE STATISTICS =========");
+            System.out.println("Total cache hits: " + cacheHits);
+            System.out.println("Total cache misses: " + cacheMisses);
+            double hitRate = (double) cacheHits / (cacheHits + cacheMisses) * 100;
+            System.out.println("Cache hit rate: " + String.format("%.2f", hitRate) + "%");
+            
+            System.out.println("----- Per Video Statistics -----");
+            for (String video : videoHitStats.keySet()) {
+                int hits = videoHitStats.getOrDefault(video, 0);
+                int misses = videoMissStats.getOrDefault(video, 0);
+                double rate = (double) hits / (hits + misses) * 100;
+                System.out.println(video + ": " + hits + " hits, " + misses + " misses (" + 
+                                  String.format("%.2f", rate) + "% hit rate)");
+            }
+            
+            // Add cache size information
+            System.out.println("----- Cache Size Information -----");
+            for (String video : relayCache.keySet()) {
+                System.out.println(video + ": " + relayCache.get(video).size() + " frames in cache");
+            }
+            
+            System.out.println("===================================");
+        }
+
+       private void handleVideoRequest(String request) throws IOException {
             String[] parts = request.split(" ");
             if (parts.length != 2) {
                 System.out.println("ERROR: Invalid request format!");
@@ -116,52 +179,47 @@ class VideoRelay {
             }
 
             String videoName = parts[0];
-            int totalRequestedFrames = Integer.parseInt(parts[1]);
+            int frameIndex = Integer.parseInt(parts[1]);
 
-            // Reset state when a new video is requested.
-            if (currentVideo == null || !currentVideo.equals(videoName)) {
-                currentVideo = videoName;
-                lastDelivered = 0;
-                cacheHitLogged.clear(); // Clear tracked logs on new video
-                deliveredFrames.clear(); // Clear delivered frames on new video
-            }
-
-            // Ensure relay cache exists for this video.
-            relayCache.putIfAbsent(videoName, new LinkedHashMap<Integer, byte[]>(BUFFER_SIZE, 0.75f, true) {
-                @Override
-                protected boolean removeEldestEntry(Map.Entry<Integer, byte[]> eldest) {
-                    return size() > BUFFER_SIZE; // Ensure the cache size doesn't exceed BUFFER_SIZE.
-                }
-            });
-
-            LinkedHashMap<Integer, byte[]> videoCache = relayCache.get(videoName);
-            List<Integer> missingFrames = new ArrayList<>();
-
-            // Send frames from cache (from 0 to 99 or any existing frames in the cache).
-            for (int frameIndex = 0; frameIndex < totalRequestedFrames; frameIndex++) {
-                if (deliveredFrames.contains(frameIndex)) continue;
-
-                if (videoCache.containsKey(frameIndex)) {
-                    String key = videoName + "_" + frameIndex;
-                    if (!cacheHitLogged.contains(key)) {
-                        System.out.println("DEBUG (Relay): Sending " + videoName + " frame " + frameIndex + " from cache ✅");
-                        cacheHitLogged.add(key);
+            // Ensure cache exists for this video
+            if (!relayCache.containsKey(videoName)) {
+                // Create a cache with a higher capacity and true access-order parameter
+                relayCache.put(videoName, Collections.synchronizedMap(new LinkedHashMap<Integer, byte[]>(BUFFER_SIZE, 0.75f, true) {
+                    @Override
+                    protected boolean removeEldestEntry(Map.Entry<Integer, byte[]> eldest) {
+                        return size() > BUFFER_SIZE;
                     }
-                    byte[] cachedFrame = videoCache.get(frameIndex);
-                    sendFrame(cachedFrame, calculateChecksum(cachedFrame), frameIndex, true);
-                    deliveredFrames.add(frameIndex);
-                } else {
-                    missingFrames.add(frameIndex); // Collect frames that are not in cache.
-                }
+                }));
+                System.out.println("DEBUG (Relay): Created new cache for " + videoName);
             }
 
-            // For frames not in cache (e.g., from 100 to 149), request them from the server.
-            for (int frameIndex : missingFrames) {
-                System.out.println("DEBUG (Relay): Frame " + frameIndex + " not in cache. Requesting from server...");
+            Map<Integer, byte[]> videoCache = relayCache.get(videoName);
+
+            // Debug: show current cache keys
+            System.out.println("DEBUG (Relay): Cache keys for " + videoName + " = " + videoCache.keySet());
+
+            // Check if frame is in cache
+            if (videoCache.containsKey(frameIndex)) {
+                System.out.println("DEBUG (Relay): Cache HIT for " + videoName + " frame " + frameIndex + " ✅");
+                byte[] cachedFrame = videoCache.get(frameIndex);
+                
+                // Update cache statistics
+                cacheHits++;
+                videoHitStats.put(videoName, videoHitStats.getOrDefault(videoName, 0) + 1);
+                
+                // Move this entry to the end of the LRU queue by accessing it
+                videoCache.get(frameIndex);
+                
+                sendFrame(cachedFrame, calculateChecksum(cachedFrame), frameIndex, true);
+            } else {
+                System.out.println("DEBUG (Relay): Cache MISS for " + videoName + " frame " + frameIndex + ". Requesting from server...");
+                
+                // Update cache statistics
+                cacheMisses++;
+                videoMissStats.put(videoName, videoMissStats.getOrDefault(videoName, 0) + 1);
+                
                 requestFrameFromServer(videoName, frameIndex);
             }
-
-            lastDelivered = totalRequestedFrames; // Update last delivered frame.
         }
 
         private void requestFrameFromServer(String videoName, int frameIndex) throws IOException {
@@ -177,9 +235,14 @@ class VideoRelay {
             long rtt = endTime - startTime;
             onSuccessfulTransmission(rtt);
 
-            relayCache.get(videoName).put(frameIndex, frameData);
+            // Store in cache
+            Map<Integer, byte[]> videoCache = relayCache.get(videoName);
+            videoCache.put(frameIndex, frameData);
+
+            System.out.println("DEBUG (Relay): Stored frame " + frameIndex + " into cache for " + videoName);
+            System.out.println("DEBUG (Relay): Cache size for " + videoName + " = " + videoCache.size());
+
             sendFrame(frameData, checksum, frameIndex, false);
-            deliveredFrames.add(frameIndex); // ✅ Mark as delivered
         }
 
         private void sendFrame(byte[] frame, int checksum, int frameIndex, boolean fromCache) throws IOException {
@@ -191,6 +254,7 @@ class VideoRelay {
             outToClient.writeInt(frame.length);
             outToClient.write(frame);
             outToClient.writeInt(checksum);
+            outToClient.writeBoolean(fromCache); // Send cache status to client
             outToClient.flush();
         }
 

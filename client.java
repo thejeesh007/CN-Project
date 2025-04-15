@@ -1,12 +1,12 @@
 import java.awt.*;
-import java.awt.image.BufferedImage;
+import java.awt.image.*;
 import java.io.*;
 import java.net.*;
 import java.util.*;
 import javax.imageio.ImageIO;
 import javax.swing.*;
 
-class VideoClient {
+public class VideoClient {
     private static final int HEARTBEAT_INTERVAL = 5000;
     private static boolean isPaused = false;
     private static boolean isRunning = true;
@@ -51,7 +51,7 @@ class VideoClient {
         }).start();
 
         // UI Setup
-        frame = new JFrame("🔥 Live Video Stream with ABR + TCP AIMD 🔥");
+        frame = new JFrame("Live Video Stream with ABR + TCP AIMD");
         frame.setLayout(new BorderLayout());
         frame.setSize(1000, 700);
         frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
@@ -184,7 +184,12 @@ class VideoClient {
                     }
 
                     ByteArrayInputStream bis = new ByteArrayInputStream(frameData);
-                    BufferedImage image = ImageIO.read(bis);
+                    BufferedImage image = null;
+                    try {
+                        image = ImageIO.read(bis);
+                    } catch (Exception e) {
+                        System.out.println("Error decoding frame " + j + ": " + e.getMessage());
+                    }
 
                     if (image != null) {
                         videoLabel.setIcon(new ImageIcon(image));
@@ -192,14 +197,29 @@ class VideoClient {
                         logLabel.setText("Logs: Displaying frame " + j);
                         progressBar.setValue(j + 1);
                         timelineSlider.setValue(j);
+
+                        // ✅ Free old cached frames
+                        if (frameCache.size() > 100) {
+                            int firstKey = frameCache.keySet().iterator().next();
+                            frameCache.get(firstKey).flush();
+                            frameCache.remove(firstKey);
+                        }
+
                         frameCache.put(j, image);
+
                         long currentTime = System.currentTimeMillis();
                         double fps = 1000.0 / (currentTime - lastFrameTime);
                         lastFrameTime = currentTime;
                         fpsLabel.setText("FPS: " + String.format("%.2f", fps));
-                    } else {
-                        logLabel.setText("Logs: ERROR - Image could not be read for frame " + j);
+
+                        image.flush();
+                        image = null;
                     }
+                }
+                // ✅ Force garbage collection every 50 frames
+                if (i % 50 == 0) {
+                    System.gc();
+                    System.out.println("DEBUG: Memory cleaned at frame " + i);
                 }
                 System.out.println("Client: cwnd = " + cwnd + ", ssthresh = " + ssthresh);
             }
@@ -208,11 +228,8 @@ class VideoClient {
 
     private static JButton createStyledButton(String text, Color color) {
         JButton button = new JButton(text);
-        button.setFocusPainted(false);
-        button.setFont(new Font("Arial", Font.BOLD, 14));
         button.setBackground(color);
         button.setForeground(Color.WHITE);
-        button.setBorder(BorderFactory.createLineBorder(Color.BLACK, 2));
         return button;
     }
 
